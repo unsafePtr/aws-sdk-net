@@ -1,7 +1,13 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
+using System.Threading.Tasks;
+using Amazon.Runtime;
 using Amazon.Runtime.Internal.Auth;
+using Amazon.Runtime.Internal.Util;
 using Amazon.Util;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 
@@ -401,6 +407,77 @@ namespace AWSSDK.UnitTests
                 Sign("secret-" + i, SigningTestDate);
 
             Assert.AreEqual(before, Sign("secret-a", SigningTestDate).Signature);
+        }
+
+        [TestMethod]
+        public void ComputeSignature_ConcurrentScopesAndDates_MatchIndependentHmac()
+        {
+            // Two regions on two UTC dates, so threads share, replace and alternate cached keys and their HMACs.
+            var regions = new[] { "us-east-1", "eu-west-1" };
+            var dates = new[] { SigningTestDate, SigningTestDate.AddDays(1) };
+            var results = new string[2000];
+            Parallel.For(0, results.Length, new ParallelOptions { MaxDegreeOfParallelism = 8 },
+                i => results[i] = Sign("secret-a", regions[i % 2], dates[i / 2 % 2], "canonical-request").Signature);
+
+            for (int i = 0; i < results.Length; i++)
+                Assert.AreEqual(IndependentSignature("secret-a", regions[i % 2], dates[i / 2 % 2], "canonical-request"), results[i], "call " + i);
+        }
+
+        [TestMethod]
+        [DataRow("T", 1500)]
+        [DataRow("\u20AC", 400)]
+        [DataRow("caf\u00E9 \u4E2D\u6587", 1)]
+        public void ComputeSignature_LongAndMultiByteCanonicalRequests_MatchIndependentHmac(string unit, int count)
+        {
+            // Longer than the signer's 1,024-byte UTF-8 stack buffer, longer only in UTF-8 bytes, and a short multi-byte value.
+            var canonicalRequest = string.Concat(Enumerable.Repeat(unit, count));
+            Assert.AreEqual(IndependentSignature("secret-a", "us-east-1", SigningTestDate, canonicalRequest),
+                Sign("secret-a", "us-east-1", SigningTestDate, canonicalRequest).Signature);
+        }
+
+        [TestMethod]
+        public void ComputeSignature_WithMetrics_RecordsStringToSignAsStringBuilder()
+        {
+            var metrics = new RequestMetrics { IsEnabled = true };
+            AWS4Signer.ComputeSignature("AKIAEXAMPLE", "secret-a", "us-east-1", SigningTestDate, "s3", "host", "canonical-request", metrics);
+
+            var stringToSign = metrics.Properties[Metric.StringToSign].Single();
+            Assert.IsInstanceOfType(stringToSign, typeof(StringBuilder));
+            StringAssert.StartsWith(stringToSign.ToString(), "AWS4-HMAC-SHA256\n20240115T123000Z\n20240115/us-east-1/s3/aws4_request\n");
+        }
+
+        [TestMethod]
+        public void FormatDateTime_MatchesDateTimeToString()
+        {
+            var dates = new[]
+            {
+                new DateTime(1, 1, 1, 0, 0, 0, DateTimeKind.Utc),
+                new DateTime(999, 12, 31, 23, 59, 59, DateTimeKind.Utc),
+                new DateTime(2024, 2, 29, 9, 5, 7, DateTimeKind.Local),
+                new DateTime(2024, 10, 5, 13, 14, 15, DateTimeKind.Unspecified),
+                new DateTime(9999, 12, 31, 23, 59, 59, 999, DateTimeKind.Utc),
+            };
+            foreach (var date in dates)
+            {
+                foreach (var format in new[] { AWSSDKUtils.ISO8601BasicDateTimeFormat, AWSSDKUtils.ISO8601BasicDateFormat })
+                    Assert.AreEqual(date.ToUniversalTime().ToString(format, CultureInfo.InvariantCulture), AWS4Signer.FormatDateTime(date, format));
+            }
+        }
+
+        private static AWS4SigningResult Sign(string secret, string region, DateTime signedAt, string canonicalRequest)
+            => AWS4Signer.ComputeSignature("AKIAEXAMPLE", secret, region, signedAt, "s3", "host", canonicalRequest);
+
+        private static string IndependentSignature(string secret, string region, DateTime signedAt, string canonicalRequest)
+        {
+            var date = signedAt.ToString("yyyyMMdd", CultureInfo.InvariantCulture);
+            string stringToSign;
+            using (var sha256 = SHA256.Create())
+            {
+                stringToSign = "AWS4-HMAC-SHA256\n" + signedAt.ToString("yyyyMMddTHHmmssZ", CultureInfo.InvariantCulture) + "\n" +
+                    date + "/" + region + "/s3/aws4_request\n" + AWSSDKUtils.ToHex(sha256.ComputeHash(Encoding.UTF8.GetBytes(canonicalRequest)), true);
+            }
+            using (var hmac = new HMACSHA256(AWS4Signer.ComposeSigningKey(secret, region, date, "s3")))
+                return AWSSDKUtils.ToHex(hmac.ComputeHash(Encoding.UTF8.GetBytes(stringToSign)), true);
         }
 
         // -----------------------------------------------------------------------
